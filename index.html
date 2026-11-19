@@ -32,7 +32,55 @@ const terms=[['Dosage','The amount of a medicine to take at one time.'],['Freque
 function tab(name,el){['summary','education','organizer','agents'].forEach(t=>$(t+'Tab').classList.toggle('hidden',t!==name));document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b===el));if(name==='organizer')fillPlanner()}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 $('mode').addEventListener('change',()=> $('apiField').classList.toggle('hidden',$('mode').value!=='api'));
-async function analyze(){let txt=$('rxText').value.trim();if($('mode').value==='api'){let url=$('apiUrl').value.trim();if(!url){toast('Enter your backend endpoint first');return}try{$('status').textContent='Connecting…';$('analyzeBtn').innerHTML='<span class="spinner"></span> Analyzing';let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:txt})});if(!r.ok)throw Error('API returned '+r.status);let j=await r.json();data=normalize(j);render();$('status').textContent='Backend response received';toast('Analysis received. Verify all details.')}catch(e){$('status').textContent='Backend error';toast('Could not reach backend: '+e.message)}finally{$('analyzeBtn').textContent='✦ Analyze prescription'}return}if(!txt){toast('Enter text or load the sample first');return}let meds=[];let patterns=[/([A-Z][a-zA-Z]+)\s+(\d+\s?(?:mg|mcg|g|ml))?/g];for(let m of txt.matchAll(patterns[0])){if(!['Rx','After','Take','Once','Twice','Three','Daily','Sample'].includes(m[1])&&!meds.some(x=>x.name.toLowerCase()===m[1].toLowerCase()))meds.push({name:m[1],salt:'Needs verification',dose:m[2]||'Not clear',frequency:'Not reliably extracted',duration:'Not reliably extracted',instructions:'Please verify against the original prescription.',purpose:'Not determined from text.',warnings:['Automatic text parsing is not a medical validation. Confirm the medicine and instructions with a pharmacist.'],confidence:50})}data={patient:{name:'Not identified',age:'',gender:'',date:'Not identified'},doctor:'Not identified',allergies:[],notes:'Text-only demo parsing. No clinical validation was performed. Confirm all extracted information with a qualified professional.',medicines:meds};render();$('status').textContent='Text parsed · verify';toast('Basic text extraction complete; verify manually')}
+function cleanOCR(s){return String(s||'').replace(/\r/g,'').replace(/[|]/g,'I').replace(/[“”]/g,'"').replace(/[‘’]/g,"'").replace(/[ \t]+/g,' ').trim()}
+function extractPatientDetails(text){
+ const lines=cleanOCR(text).split('\n').map(x=>x.trim()).filter(Boolean), all=lines.join('\n'), one=all.replace(/\n/g,' ');
+ const pick=(re)=>{let m=one.match(re);return m?String(m[1]||'').trim().replace(/[,:;]+$/,''):''};
+ let name=pick(/(?:patient\s*name|patient|name)\s*[:\-]\s*([A-Z][A-Za-z.' -]{2,50}?)(?=\s+(?:age|sex|gender|dob|date|doctor|dr\.?|allerg|diagnos|address)\b|[,;\n]|$)/i);
+ if(!name){let m=all.match(/(?:patient\s*details?)[^\n]*\n\s*([A-Z][A-Za-z.' -]{3,45})/i);if(m)name=m[1].trim()}
+ let age='',gender='';
+ let ag=one.match(/\b(?:age\s*[:\-]?\s*)?(\d{1,3})\s*(?:years?|yrs?|y\/?o)?\s*[\/, -]\s*(male|female|m|f)\b/i);
+ if(!ag)ag=one.match(/\b(?:age\s*[:\-]\s*)(\d{1,3})\b/i);
+ if(ag){age=ag[1];gender=ag[2]?(/^f/i.test(ag[2])?'Female':'Male'):''}
+ if(!gender){let g=one.match(/\b(?:sex|gender)\s*[:\-]\s*(male|female|m|f)\b/i);if(g)gender=/^f/i.test(g[1])?'Female':'Male'}
+ if(!name){let m=one.match(/\b(?:patient\s*name|name)\s*[:\-]\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b/);if(m)name=m[1]}
+ let doctor=pick(/(?:doctor|physician|consultant)\s*[:\-]\s*((?:dr\.?\s*)?[A-Z][A-Za-z.' -]{2,45}?)(?=\s+(?:date|reg|registration|phone|patient|age)\b|[,;\n]|$)/i);
+ if(!doctor){let d=one.match(/\b(Dr\.?\s+[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,2})\b/i);if(d)doctor=d[1]}
+ let date=pick(/(?:prescription\s*)?date\s*[:\-]\s*((?:\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4})|(?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})|(?:[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}))/i);
+ if(!date){let d=one.match(/\b(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4})\b/);if(d)date=d[1]}
+ let allergy=pick(/(?:allerg(?:y|ies)|known allergies)\s*[:\-]\s*([^.;\n]{1,100})/i);
+ return {patient:{name:name||'Not identified',age:age||'',gender:gender||'',date:date||'Not identified'},doctor:doctor||'Not identified',allergies:allergy?[allergy]:[],notes:'Fields were extracted from OCR text and may contain recognition errors. Verify patient identity, allergies, medicine names and instructions against the original prescription.',medicines:extractMedicines(all)}
+}
+function extractMedicines(text){
+ const lines=cleanOCR(text).split('\n').map(x=>x.trim()).filter(Boolean);
+ const known=['paracetamol','acetaminophen','azithromycin','levocetirizine','cetirizine','ambroxol','amoxicillin','ibuprofen','metformin','omeprazole','pantoprazole','ciprofloxacin','doxycycline','prednisolone',' montelukast','atorvastatin','amlodipine','losartan','cetirizine','dolo','crocin','calpol'];
+ const out=[], seen=new Set();
+ for(const line of lines){
+  const low=line.toLowerCase();
+  if(/^(?:patient|name|age|sex|gender|doctor|dr\.?|date|clinic|hospital|address|phone|diagnosis|advice|follow.?up|allerg)/i.test(line))continue;
+  let name='';
+  const hit=known.find(n=>n.trim()&&new RegExp('\\b'+n.trim()+'\\b','i').test(line));
+  if(hit)name=hit.trim().replace(/\b\w/g,c=>c.toUpperCase());
+  if(!name){
+   const m=line.match(/\b([A-Z][a-z]{4,}(?:[A-Z][a-z]+)?)\s+(?=\d+\s?(?:mg|mcg|g|ml)\b|\b(?:tablet|tab|capsule|cap|syrup|injection)\b)/i);
+   if(m&&!/^(?:city|clinic|hospital|patient|doctor|diagnosis|follow|after|before|take|once|twice|daily|morning|evening|night)$/i.test(m[1]))name=m[1];
+  }
+  if(!name)continue;
+  const key=name.toLowerCase();if(seen.has(key))continue;seen.add(key);
+  const strength=(line.match(/\b\d+(?:\.\d+)?\s?(?:mg|mcg|g|ml)(?:\s*\/\s*\d+(?:\.\d+)?\s?(?:mg|mcg|g|ml))?\b/i)||[])[0]||'';
+  const freq=(line.match(/\b(?:once|twice|thrice|one|two|three)\s+(?:a\s+)?(?:daily|day|times? daily)|\b\d+\s+times?\s+(?:a\s+)?day|\b(?:OD|BD|BID|TDS|TID|QID|SOS|HS)\b/i)||[])[0]||'';
+  const duration=(line.match(/\b(?:for\s*)?\d+\s*(?:days?|weeks?)\b/i)||[])[0]||'';
+  const instr=(line.match(/\b(?:after|before|with)\s+(?:food|meals?|water)\b|\b(?:at bedtime|as needed|SOS)\b/i)||[])[0]||'';
+  out.push({name,salt:'Active ingredient not independently confirmed',dose:strength||'Not clear',frequency:freq||'Not reliably extracted',duration:duration||'Not reliably extracted',instructions:instr||'Verify against the original prescription.',purpose:'Not determined from OCR text.',warnings:['OCR and automatic parsing can misread handwriting. Confirm this medicine and every instruction with a pharmacist or prescriber.'],confidence:strength?75:55});
+ }
+ return out
+}
+async function analyze(){
+ let txt=$('rxText').value.trim();
+ if($('mode').value==='api'){let url=$('apiUrl').value.trim();if(!url){toast('Enter your backend endpoint first');return}try{$('status').textContent='Connecting…';$('analyzeBtn').innerHTML='<span class="spinner"></span> Analyzing';let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:txt})});if(!r.ok)throw Error('API returned '+r.status);let j=await r.json();data=normalize(j);render();$('status').textContent='Backend response received';toast('Analysis received. Verify all details.')}catch(e){$('status').textContent='Backend error';toast('Could not reach backend: '+e.message)}finally{$('analyzeBtn').textContent='✦ Analyze prescription'}return}
+ if(!txt){toast('Enter text or load the sample first');return}
+ data=extractPatientDetails(txt);render();$('status').textContent='Text parsed · verify details';toast('Patient and medicine fields extracted where recognizable. Please verify all results.')
+}
 function normalize(j){return {patient:j.patient_details||j.patient||{},doctor:j.doctor_details?.name||j.doctor||'Not identified',allergies:j.patient_allergies||j.allergies||[],notes:j.clinical_notes||j.notes||'Verify details.',medicines:(j.medicines||[]).map(m=>({name:m.brand_name||m.name||'Unknown',salt:m.salt_name||m.salt||'',dose:m.dosage||m.dose||'',frequency:m.frequency||'',duration:m.duration||'',instructions:m.instructions||'',purpose:m.purpose||'',warnings:m.safety_warnings||m.warnings||[],confidence:m.confidence_score||m.confidence||0}))}}
 $('rxFile').addEventListener('change',async e=>{let f=e.target.files[0];if(!f)return;$('fileName').textContent=f.name+' · '+Math.round(f.size/1024)+' KB';$('status').textContent='Image selected';if(!window.Tesseract){toast('OCR library loading; use text input if unavailable');return}try{$('status').textContent='Extracting text…';$('fileName').textContent=f.name+' · OCR running';let out=await Tesseract.recognize(f,'eng');$('rxText').value=out.data.text;$('fileName').textContent=f.name+' · OCR complete';$('status').textContent='OCR complete · review text';toast('OCR complete. Check every word and number.')}catch(err){$('status').textContent='OCR unavailable';toast('Could not OCR image. Please type the text manually.')}});
 function fillPlanner(){let sel=$('plannerMedicine');sel.innerHTML=(data.medicines||[]).map((m,i)=>`<option value="${i}">${esc(m.name)}</option>`).join('')||'<option>No medicines</option>';if(!$('weekGrid').children.length)$('weekGrid').innerHTML=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(d=>`<label class="day"><b>${d}</b><input type="checkbox" value="${d}" checked></label>`).join('');renderPlanner()}
